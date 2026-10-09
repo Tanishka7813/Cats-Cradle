@@ -1,0 +1,367 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Cat's Cradle — Hand Tracking</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #000; overflow: hidden; font-family: 'Courier New', monospace; }
+  #container { position: relative; width: 100vw; height: 100vh; display: flex; align-items: center; justify-content: center; }
+  video { position: absolute; opacity: 0; pointer-events: none; }
+  canvas { position: absolute; top: 0; left: 0; }
+  #p5canvas { z-index: 2; }
+  #ui { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); z-index: 10; color: #0ff; font-size: 12px; letter-spacing: 2px; text-align: center; opacity: 0.6; text-shadow: 0 0 8px #0ff; }
+  #status { position: fixed; top: 20px; left: 50%; transform: translateX(-50%); z-index: 10; color: #0ff; font-size: 13px; letter-spacing: 3px; text-align: center; text-shadow: 0 0 10px #0ff; padding: 8px 20px; border: 1px solid rgba(0,255,255,0.3); background: rgba(0,0,0,0.6); }
+</style>
+</head>
+<body>
+<div id="container">
+  <div id="status">INITIALIZING HAND TRACKER...</div>
+  <video id="video" playsinline></video>
+</div>
+<div id="ui">BRING BOTH HANDS INTO FRAME &nbsp;|&nbsp; CAT'S CRADLE v1.0</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.0/p5.min.js"></script>
+
+<script>
+const videoEl = document.getElementById('video');
+const statusEl = document.getElementById('status');
+
+let detectedHands = [];
+let videoWidth = 0, videoHeight = 0;
+let canvasW = window.innerWidth, canvasH = window.innerHeight;
+
+const FINGER_TIPS = [4, 8, 12, 16, 20];
+const FINGER_COLORS = ['#ff00ff', '#00ffff', '#ffff00', '#00ff88', '#ff4488'];
+
+let hands;
+let particles = [];
+
+class Particle {
+  constructor(x, y, color) {
+    this.x = x; this.y = y; this.color = color;
+    this.vx = (Math.random() - 0.5) * 8;
+    this.vy = (Math.random() - 0.5) * 8;
+    this.life = 1.0;
+    this.size = Math.random() * 6 + 2;
+  }
+  update() {
+    this.x += this.vx;
+    this.y += this.vy;
+    this.vx *= 0.92;
+    this.vy *= 0.92;
+    this.life -= 0.035;
+    this.size *= 0.96;
+  }
+  isDead() { return this.life <= 0; }
+}
+
+const sketch = (p) => {
+  let bgCanvas;
+  let time = 0;
+
+  p.setup = () => {
+    let cnv = p.createCanvas(canvasW, canvasH);
+    cnv.id('p5canvas');
+    cnv.parent(document.getElementById('container'));
+    bgCanvas = p.createGraphics(canvasW, canvasH);
+    p.colorMode(p.RGB, 255);
+    p.frameRate(60);
+  };
+
+  p.windowResized = () => {
+    canvasW = window.innerWidth;
+    canvasH = window.innerHeight;
+    p.resizeCanvas(canvasW, canvasH);
+    bgCanvas = p.createGraphics(canvasW, canvasH);
+  };
+
+  function mapLandmark(lm) {
+    let mx = (1 - lm.x) * canvasW;
+    let my = lm.y * canvasH;
+    return { x: mx, y: my };
+  }
+
+  function drawGlowingDot(ctx, x, y, color, radius) {
+    ctx.save();
+    ctx.shadowBlur = 18;
+    ctx.shadowColor = color;
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.arc(x, y, radius, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.shadowBlur = 8;
+    ctx.shadowColor = '#ffffff';
+    ctx.fillStyle = 'rgba(255,255,255,0.85)';
+    ctx.beginPath();
+    ctx.arc(x, y, radius * 0.4, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  function drawGlowingLine(ctx, x1, y1, x2, y2, color, thickness, glowIntensity) {
+    ctx.save();
+    ctx.shadowBlur = glowIntensity * 20;
+    ctx.shadowColor = color;
+    ctx.strokeStyle = color;
+    ctx.lineWidth = thickness;
+    ctx.lineCap = 'round';
+    ctx.globalAlpha = 0.85;
+    ctx.beginPath();
+    ctx.moveTo(x1, y1);
+    ctx.lineTo(x2, y2);
+    ctx.stroke();
+    ctx.shadowBlur = glowIntensity * 40;
+    ctx.lineWidth = thickness * 0.3;
+    ctx.globalAlpha = 0.5;
+    ctx.beginPath();
+    ctx.moveTo(x1, y1);
+    ctx.lineTo(x2, y2);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  function getStringColor(dist, t) {
+    let norm = p.constrain(dist / 600, 0, 1);
+    let r, g, b;
+    if (norm < 0.5) {
+      let f = norm * 2;
+      r = Math.round(0 * (1 - f) + 255 * f);
+      g = Math.round(255 * (1 - f) + 0 * f);
+      b = Math.round(255 * (1 - f) + 255 * f);
+    } else {
+      let f = (norm - 0.5) * 2;
+      r = Math.round(255 * (1 - f) + 255 * f);
+      g = Math.round(0 * (1 - f) + 255 * f);
+      b = Math.round(255 * (1 - f) + 0 * f);
+    }
+    return `rgb(${r},${g},${b})`;
+  }
+
+  function drawVideoBackground(ctx) {
+    if (videoEl.readyState >= 2) {
+      ctx.save();
+      ctx.translate(canvasW, 0);
+      ctx.scale(-1, 1);
+      ctx.drawImage(videoEl, 0, 0, canvasW, canvasH);
+      ctx.restore();
+      ctx.fillStyle = 'rgba(0, 0, 15, 0.62)';
+      ctx.fillRect(0, 0, canvasW, canvasH);
+    } else {
+      ctx.fillStyle = '#000010';
+      ctx.fillRect(0, 0, canvasW, canvasH);
+    }
+  }
+
+  function drawScanlines(ctx) {
+    ctx.save();
+    ctx.globalAlpha = 0.03;
+    for (let y = 0; y < canvasH; y += 3) {
+      ctx.fillStyle = '#000';
+      ctx.fillRect(0, y, canvasW, 1);
+    }
+    ctx.restore();
+  }
+
+  p.draw = () => {
+    time += 0.02;
+    const ctx = p.drawingContext;
+    drawVideoBackground(ctx);
+    drawScanlines(ctx);
+
+    particles = particles.filter(pt => !pt.isDead());
+    particles.forEach(pt => {
+      pt.update();
+      ctx.save();
+      ctx.globalAlpha = pt.life * 0.9;
+      ctx.shadowBlur = 15;
+      ctx.shadowColor = pt.color;
+      ctx.fillStyle = pt.color;
+      ctx.beginPath();
+      ctx.arc(pt.x, pt.y, pt.size, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+    });
+
+    let leftHand = null, rightHand = null;
+
+    detectedHands.forEach(hand => {
+      if (hand.label === 'Left') leftHand = hand;
+      else rightHand = hand;
+    });
+
+    if (leftHand) drawHand(ctx, leftHand);
+    if (rightHand) drawHand(ctx, rightHand);
+
+    if (leftHand && rightHand) {
+      drawStrings(ctx, leftHand, rightHand, time);
+    }
+
+    
+  };
+
+  function drawHand(ctx, hand) {
+    const lms = hand.landmarks;
+
+    const CONNECTIONS = [
+      [0,1],[1,2],[2,3],[3,4],
+      [0,5],[5,6],[6,7],[7,8],
+      [0,9],[9,10],[10,11],[11,12],
+      [0,13],[13,14],[14,15],[15,16],
+      [0,17],[17,18],[18,19],[19,20],
+      [5,9],[9,13],[13,17]
+    ];
+
+    ctx.save();
+    ctx.shadowBlur = 6;
+    ctx.shadowColor = 'rgba(0,255,255,0.3)';
+    ctx.strokeStyle = 'rgba(0,255,255,0.25)';
+    ctx.lineWidth = 1;
+    CONNECTIONS.forEach(([a, b]) => {
+      const pa = mapLandmark(lms[a]);
+      const pb = mapLandmark(lms[b]);
+      ctx.beginPath();
+      ctx.moveTo(pa.x, pa.y);
+      ctx.lineTo(pb.x, pb.y);
+      ctx.stroke();
+    });
+    ctx.restore();
+
+    lms.forEach((lm, i) => {
+      const pos = mapLandmark(lm);
+      const isTip = FINGER_TIPS.includes(i);
+      const tipIdx = FINGER_TIPS.indexOf(i);
+      const color = isTip ? FINGER_COLORS[tipIdx] : 'rgba(100,200,255,0.7)';
+      const radius = isTip ? 7 : 4;
+      drawGlowingDot(ctx, pos.x, pos.y, color, radius);
+    });
+  }
+
+  function drawStrings(ctx, leftHand, rightHand, t) {
+    const leftTips = FINGER_TIPS.map(i => mapLandmark(leftHand.landmarks[i]));
+    const rightTips = FINGER_TIPS.map(i => mapLandmark(rightHand.landmarks[i]));
+
+    leftTips.forEach((lp, fi) => {
+      const rp = rightTips[fi];
+      const dist = Math.hypot(rp.x - lp.x, rp.y - lp.y);
+      const norm = Math.min(dist / 700, 1);
+      const thickness = Math.max(0.5, 3 - norm * 2.5);
+      const glowIntensity = 1 - norm * 0.5;
+      const color = getStringColor(dist, t + fi * 0.5);
+
+      const wave = Math.sin(t * 2 + fi * 1.2) * 15 * norm;
+      const mx = (lp.x + rp.x) / 2 + wave;
+      const my = (lp.y + rp.y) / 2 + wave;
+
+      ctx.save();
+      ctx.shadowBlur = glowIntensity * 18;
+      ctx.shadowColor = color;
+      ctx.strokeStyle = color;
+      ctx.lineWidth = thickness;
+      ctx.lineCap = 'round';
+      ctx.globalAlpha = 0.9;
+      ctx.beginPath();
+      ctx.moveTo(lp.x, lp.y);
+      ctx.quadraticCurveTo(mx, my, rp.x, rp.y);
+      ctx.stroke();
+      ctx.shadowBlur = glowIntensity * 35;
+      ctx.lineWidth = thickness * 0.25;
+      ctx.globalAlpha = 0.55;
+      ctx.beginPath();
+      ctx.moveTo(lp.x, lp.y);
+      ctx.quadraticCurveTo(mx, my, rp.x, rp.y);
+      ctx.stroke();
+      ctx.restore();
+
+      if (dist < 40) {
+        for (let n = 0; n < 3; n++) {
+          particles.push(new Particle((lp.x + rp.x) / 2, (lp.y + rp.y) / 2, color));
+        }
+      }
+    });
+
+    leftTips.forEach((lp, i) => {
+      rightTips.forEach((rp, j) => {
+        if (i === j) return;
+        const dist = Math.hypot(rp.x - lp.x, rp.y - lp.y);
+        if (dist < 220) {
+          const alpha = (1 - dist / 220) * 0.3;
+          const color = `rgba(255,0,255,${alpha})`;
+          ctx.save();
+          ctx.shadowBlur = 8;
+          ctx.shadowColor = '#ff00ff';
+          ctx.strokeStyle = color;
+          ctx.lineWidth = 0.5;
+          ctx.beginPath();
+          ctx.moveTo(lp.x, lp.y);
+          ctx.lineTo(rp.x, rp.y);
+          ctx.stroke();
+          ctx.restore();
+        }
+      });
+    });
+  }
+};
+
+new p5(sketch);
+
+async function initMediaPipe() {
+  hands = new Hands({
+    locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+  });
+
+  hands.setOptions({
+    maxNumHands: 2,
+    modelComplexity: 1,
+    minDetectionConfidence: 0.7,
+    minTrackingConfidence: 0.6
+  });
+
+  hands.onResults((results) => {
+    detectedHands = [];
+    if (results.multiHandLandmarks && results.multiHandedness) {
+      results.multiHandLandmarks.forEach((landmarks, i) => {
+        const label = results.multiHandedness[i].label;
+        detectedHands.push({ landmarks, label });
+      });
+    }
+    const count = detectedHands.length;
+    if (count === 0) statusEl.textContent = 'SCANNING FOR HANDS...';
+    else if (count === 1) statusEl.textContent = `1 HAND DETECTED — BRING IN SECOND HAND`;
+    else statusEl.textContent = `2 HANDS DETECTED — CAT'S CRADLE ACTIVE`;
+  });
+
+  const stream = await navigator.mediaDevices.getUserMedia({
+    video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: 'user' }
+  });
+  videoEl.srcObject = stream;
+  videoEl.onloadedmetadata = () => {
+    videoEl.play();
+    videoWidth = videoEl.videoWidth;
+    videoHeight = videoEl.videoHeight;
+    statusEl.textContent = 'SCANNING FOR HANDS...';
+  };
+
+  const camera = new Camera(videoEl, {
+    onFrame: async () => { await hands.send({ image: videoEl }); },
+    width: 1280,
+    height: 720
+  });
+  camera.start();
+}
+
+initMediaPipe().catch(err => {
+  statusEl.textContent = 'CAMERA ACCESS DENIED — PLEASE ALLOW CAMERA';
+  console.error(err);
+});
+</script>
+</body>
+</html>
+
+
+<!-- black screen removed -->
+ <!-- click on go live down -->
+ <!-- actual version from ai prompt reels -->
